@@ -6,12 +6,13 @@ import * as amqp from 'amqplib';
 import { S3 } from 'aws-sdk';
 import { Document } from '../entities/document.entity';
 import { DocumentChunk } from 'mos-be/src/shared/entities/document-chunk.entity';
-import { Configuration, OpenAIApi } from 'openai';
+import axios from 'axios';
+import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 
 @Injectable()
 export class DocumentProcessingService {
   private readonly s3: S3;
-  private readonly openai: OpenAIApi;
+  private readonly s3Client: S3Client;
 
   constructor(
     @InjectRepository(Document)
@@ -25,11 +26,13 @@ export class DocumentProcessingService {
       secretAccessKey: this.configService.get('aws.secretAccessKey'),
       region: this.configService.get('aws.region'),
     });
-
-    const configuration = new Configuration({
-      apiKey: this.configService.get('openai.apiKey'),
+    this.s3Client = new S3Client({
+      region: this.configService.get('aws.region'),
+      credentials: {
+        accessKeyId: this.configService.get('aws.accessKeyId'),
+        secretAccessKey: this.configService.get('aws.secretAccessKey'),
+      },
     });
-    this.openai = new OpenAIApi(configuration);
   }
 
   async startProcessing() {
@@ -57,19 +60,33 @@ export class DocumentProcessingService {
 
   private async processDocument(fileId: string, s3Key: string) {
     // 1. Lấy file từ S3
-    const s3Object = await this.s3
-      .getObject({
-        Bucket: this.configService.get('aws.s3BucketName'),
-        Key: s3Key,
-      })
-      .promise();
+    const params = {
+      Bucket: this.configService.get('aws.s3BucketName'),
+      Key: s3Key,
+    };
+    const command = new GetObjectCommand(params);
+    const s3Object = await this.s3Client.send(command);
+
+    // Hàm chuyển stream thành Buffer
+    const streamToBuffer = (stream: any): Promise<Buffer> =>
+      new Promise((resolve, reject) => {
+        const chunks: any[] = [];
+        stream.on('data', (chunk) => chunks.push(chunk));
+        stream.on('error', reject);
+        stream.on('end', () => resolve(Buffer.concat(chunks)));
+      });
+
+    // Chuyển đổi stream thành Buffer
+    const fileBuffer = await streamToBuffer(s3Object.Body);
+    // Chuyển Buffer thành chuỗi (UTF-8 là encoding mặc định cho text)
+    const fileContent = fileBuffer.toString('utf-8');
 
     // 2. Lưu document
     const document = await this.documentRepository.save({
       id: fileId,
       filename: s3Key.split('/').pop(),
       s3Key: s3Key,
-      content: s3Object.Body.toString(),
+      content: fileContent,
     });
 
     // 3. Phân đoạn văn bản
@@ -111,11 +128,21 @@ export class DocumentProcessingService {
   }
 
   private async createEmbedding(text: string): Promise<number[]> {
-    const response = await this.openai.createEmbedding({
-      model: 'text-embedding-ada-002',
-      input: text,
-    });
+    interface HuggingFaceResponse {
+      data: number[];
+    }
 
-    return response.data.data[0].embedding;
+    const response = await axios.post<HuggingFaceResponse>(
+      'https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2',
+      { inputs: text },
+      {
+        headers: {
+          Authorization: `Bearer ${this.configService.get('HUGGING_FACE_TOKEN')}`,
+          'Content-Type': 'application/json',
+        },
+      },
+    );
+
+    return response.data[0];
   }
 }
