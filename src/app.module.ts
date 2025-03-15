@@ -4,6 +4,10 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import configuration from './config/configuration';
+import { RabbitMQService } from 'rabbitmq/rabbitmq.service';
+// import { DocumentProcessingService } from './document-processing/document-processing.service';
+import { DocumentProcessingModule } from './document-processing/document-processing.module';
+import { RabbitMQModule } from 'rabbitmq/rabbitmq.module';
 
 @Module({
   imports: [
@@ -25,6 +29,8 @@ import configuration from './config/configuration';
       }),
       inject: [ConfigService],
     }),
+    RabbitMQModule,
+    DocumentProcessingModule,
   ],
   controllers: [AppController],
   providers: [AppService],
