@@ -3,7 +3,7 @@ pipeline {
 
     environment {
         // Thiết lập biến môi trường nếu cần, ví dụ:
-        NODE_ENV = "production"
+        NODE_ENV = "dev"
     }
 
     stages {
