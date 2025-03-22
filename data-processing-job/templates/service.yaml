@@ -4,6 +4,9 @@ metadata:
   name: {{ include "data-processing-job.fullname" . }}
   labels:
     {{- include "data-processing-job.labels" . | nindent 4 }}
+serviceAccount:
+  create: true
+  name: "data-processing-job-sa"
 spec:
   type: {{ .Values.service.type }}
   ports:
