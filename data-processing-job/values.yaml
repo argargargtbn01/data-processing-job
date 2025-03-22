@@ -2,7 +2,7 @@ replicaCount: 1
 
 image:
   repository: quang1709/data-processing-job
-  pullPolicy: IfNotPresent
+  pullPolicy: Always
   tag: "latest"
 
 service:
