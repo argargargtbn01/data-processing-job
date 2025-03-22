@@ -25,3 +25,9 @@ ingress:
 serviceAccount:
   create: true
   name: "data-processing-job-sa"
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 2
+  targetCPUUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: 80
