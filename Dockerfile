@@ -20,4 +20,4 @@ RUN npm run build
 CMD ["node", "dist/src/main.js"]
 
 # Expose the application port
-EXPOSE 3000
+EXPOSE 3001

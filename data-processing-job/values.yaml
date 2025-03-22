@@ -7,8 +7,8 @@ image:
 
 service:
   type: NodePort
-  port: 3000
-  targetPort: 3000
+  port: 3001
+  targetPort: 3001
   nodePort: 30007
 
 resources:
