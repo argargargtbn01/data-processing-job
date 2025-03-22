@@ -18,7 +18,10 @@ resources:
   requests:
     cpu: "100m"
     memory: "256Mi"
-    
+
+ingress:
+  enabled: false
+
 serviceAccount:
   create: true
   name: "data-processing-job-sa"
