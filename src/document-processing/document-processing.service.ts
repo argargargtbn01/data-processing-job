@@ -4,11 +4,12 @@ import { Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import * as amqp from 'amqplib';
 import { Document } from '../entities/document.entity';
-
+import * as https from 'https';
 import axios from 'axios';
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { RabbitMQService } from 'rabbitmq/rabbitmq.service';
 import { DocumentChunk } from 'src/entities/document-chunk.entity';
+import { NodeHttpHandler } from '@aws-sdk/node-http-handler';
 
 @Injectable()
 export class DocumentProcessingService implements OnModuleInit {
@@ -28,6 +29,11 @@ export class DocumentProcessingService implements OnModuleInit {
         accessKeyId: this.configService.get('aws.accessKeyId'),
         secretAccessKey: this.configService.get('aws.secretAccessKey'),
       },
+      requestHandler: new NodeHttpHandler({
+        httpsAgent: new https.Agent({
+          rejectUnauthorized: false,
+        }),
+      }),
     });
   }
 
