@@ -20,6 +20,12 @@ export class Document {
   @Column('text')
   content: string;
 
+  @Column({default: 1})
+  botId: number;
+
+  @Column({ default: 'Processing' })
+  status: string;
+
   @CreateDateColumn()
   createdAt: Date;
 

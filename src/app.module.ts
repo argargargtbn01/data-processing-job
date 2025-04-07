@@ -8,7 +8,6 @@ import { RabbitMQService } from 'rabbitmq/rabbitmq.service';
 // import { DocumentProcessingService } from './document-processing/document-processing.service';
 import { DocumentProcessingModule } from './document-processing/document-processing.module';
 import { RabbitMQModule } from 'rabbitmq/rabbitmq.module';
-
 @Module({
   imports: [
     ConfigModule.forRoot({

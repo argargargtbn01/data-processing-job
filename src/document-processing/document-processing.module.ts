@@ -5,9 +5,15 @@ import { DocumentProcessingService } from './document-processing.service';
 import { Document } from '../entities/document.entity';
 import { DocumentChunk } from 'src/entities/document-chunk.entity';
 import { RabbitMQModule } from 'rabbitmq/rabbitmq.module';
+import { AIHubModule } from 'src/ai-hub/ai-hub.module';
 
 @Module({
-  imports: [ConfigModule, TypeOrmModule.forFeature([Document, DocumentChunk]), RabbitMQModule],
+  imports: [
+    ConfigModule,
+    TypeOrmModule.forFeature([Document, DocumentChunk]),
+    RabbitMQModule,
+    AIHubModule,
+  ],
   providers: [DocumentProcessingService],
   exports: [DocumentProcessingService],
 })
