@@ -4,6 +4,8 @@ import {
   Entity,
   PrimaryGeneratedColumn,
   UpdateDateColumn,
+  ManyToOne,
+  JoinColumn,
 } from 'typeorm';
 
 @Entity('documents')
@@ -20,11 +22,23 @@ export class Document {
   @Column('text')
   content: string;
 
-  @Column({default: 1})
+  @Column({ nullable: false })
   botId: number;
 
   @Column({ default: 'Processing' })
   status: string;
+
+  @Column({ nullable: true })
+  mimeType: string;
+
+  @Column({ nullable: true })
+  fileSize: number;
+
+  @Column({ nullable: true })
+  chunkCount: number;
+
+  @Column({ nullable: true })
+  processingError: string;
 
   @CreateDateColumn()
   createdAt: Date;

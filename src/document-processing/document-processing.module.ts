@@ -1,18 +1,19 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { ConfigModule } from '@nestjs/config';
-import { DocumentProcessingService } from './document-processing.service';
 import { Document } from '../entities/document.entity';
-import { DocumentChunk } from 'src/entities/document-chunk.entity';
-import { RabbitMQModule } from 'rabbitmq/rabbitmq.module';
-import { AIHubModule } from 'src/ai-hub/ai-hub.module';
+import { DocumentProcessingService } from './document-processing.service';
+import { TextSplitterModule } from '../text-splitter/text-splitter.module';
+import { EmbeddingModule } from '../embedding/embedding.module';
+import { StorageModule } from '../storage/storage.module';
+import { QueueModule } from '../queue/queue.module';
 
 @Module({
   imports: [
-    ConfigModule,
-    TypeOrmModule.forFeature([Document, DocumentChunk]),
-    RabbitMQModule,
-    AIHubModule,
+    TypeOrmModule.forFeature([Document]),
+    TextSplitterModule,
+    EmbeddingModule,
+    StorageModule,
+    QueueModule,
   ],
   providers: [DocumentProcessingService],
   exports: [DocumentProcessingService],

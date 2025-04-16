@@ -7,6 +7,7 @@ import configuration from './config/configuration';
 import { RabbitMQService } from 'rabbitmq/rabbitmq.service';
 // import { DocumentProcessingService } from './document-processing/document-processing.service';
 import { DocumentProcessingModule } from './document-processing/document-processing.module';
+import { DocumentModule } from './document/document.module';
 import { RabbitMQModule } from 'rabbitmq/rabbitmq.module';
 @Module({
   imports: [
@@ -30,6 +31,7 @@ import { RabbitMQModule } from 'rabbitmq/rabbitmq.module';
     }),
     RabbitMQModule,
     DocumentProcessingModule,
+    DocumentModule,
   ],
   controllers: [AppController],
   providers: [AppService],

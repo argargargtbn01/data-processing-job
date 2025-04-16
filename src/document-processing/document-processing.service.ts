@@ -1,176 +1,341 @@
-import { Injectable, OnModuleInit, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { ConfigService } from '@nestjs/config';
-import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
-import { NodeHttpHandler } from '@aws-sdk/node-http-handler';
-import * as https from 'https';
 import { Document } from '../entities/document.entity';
-import { DocumentChunk } from '../entities/document-chunk.entity';
-import { AIHubService } from 'src/ai-hub/ai-hub.service';
-import { RabbitMQService } from 'rabbitmq/rabbitmq.service';
-import { v4 as uuidv4 } from 'uuid';
+import { TextSplitterService } from '../text-splitter/text-splitter.service';
+import { S3Service } from '../storage/s3.service';
+import { DocumentQueueService, DocumentProcessingJob } from '../queue/document-queue.service';
+import { EmbeddingService } from '../embedding/embedding.service';
+import axios from 'axios';
+import { ConfigService } from '@nestjs/config';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+import * as util from 'util';
+
+const writeFile = util.promisify(fs.writeFile);
+const unlink = util.promisify(fs.unlink);
+const mkdir = util.promisify(fs.mkdir);
+
 @Injectable()
 export class DocumentProcessingService implements OnModuleInit {
   private readonly logger = new Logger(DocumentProcessingService.name);
-  private readonly s3Client: S3Client;
+  private tempDir: string;
+  private readonly dataHubUrl: string;
 
   constructor(
     @InjectRepository(Document)
     private documentRepository: Repository<Document>,
-    @InjectRepository(DocumentChunk)
-    private chunkRepository: Repository<DocumentChunk>,
+    private textSplitterService: TextSplitterService,
+    private s3Service: S3Service,
+    private documentQueueService: DocumentQueueService,
+    private embeddingService: EmbeddingService,
     private configService: ConfigService,
-    private aiHubService: AIHubService,
-    private readonly rabbitMQService: RabbitMQService, // Inject RabbitMQService
   ) {
-    this.s3Client = new S3Client({
-      region: this.configService.get('aws.region'),
-      credentials: {
-        accessKeyId: this.configService.get('aws.accessKeyId'),
-        secretAccessKey: this.configService.get('aws.secretAccessKey'),
-      },
-      requestHandler: new NodeHttpHandler({
-        httpsAgent: new https.Agent({
-          rejectUnauthorized: false,
-        }),
-      }),
-    });
+    this.tempDir = path.join(os.tmpdir(), 'document-processing');
+    this.dataHubUrl = this.configService.get<string>('DATA_HUB_URL') || 'http://localhost:3002'; // Sử dụng port 3002 cho data-hub
+    this.ensureTempDir();
   }
 
   async onModuleInit() {
-    try {
-      await this.startProcessing();
-      this.logger.log('DocumentProcessingService consumer started.');
-    } catch (error) {
-      this.logger.error('Error starting DocumentProcessingService consumer:', error.stack);
-    }
+    // Khởi tạo consumer cho document processing queue
+    await this.documentQueueService.consumeDocumentQueue(
+      async (job) => await this.processDocumentJob(job),
+    );
   }
 
-  async startProcessing() {
-    const channel = this.rabbitMQService.getChannel();
-    const queue = this.configService.get('rabbitmq.fileProcessingQueue') || 'file-processing-queue';
-
-    await channel.assertQueue(queue, { durable: true });
-    this.logger.log(`Waiting for messages in queue ${queue}`);
-
-    channel.consume(queue, async (msg) => {
-      if (msg) {
-        try {
-          const contentString = msg.content.toString();
-          this.logger.log(`Received message: ${contentString}`);
-
-          if (!contentString) {
-            throw new Error('Message content is empty');
-          }
-
-          const { bucket, name } = JSON.parse(contentString);
-          this.logger.log(`Processing document:  s3Key = ${bucket}/${name}`);
-          const documentId = uuidv4();
-          await this.processDocument(documentId, bucket, name);
-          this.logger.log(`Successfully processed document: s3Key = ${bucket}/${name}`);
-          channel.ack(msg);
-        } catch (error) {
-          this.logger.error('Error processing message:', error.stack);
-          channel.nack(msg, false, true); // Nack và requeue nếu lỗi
-        }
-      }
-    });
-  }
-
-  private async processDocument(documentId: string, bucket: string, name: string) {
-    this.logger.log(`Starting processDocument for: ${documentId}`);
-
+  private async ensureTempDir() {
     try {
-      // 1. Tải file từ S3
-      const content = await this.getFileFromS3(bucket, `${name}`);
-      this.logger.log(`Fetched content from S3 for ${name}, length: ${content.length}`);
-      // 2. Lưu document
-      const document = await this.documentRepository.save({
-        id: documentId,
-        filename: name,
-        s3Key: `${name}`,
-        content,
-        status: 'Processing',
-      });
-      this.logger.log(`Document saved with ID: ${documentId}`);
-
-      // 3. Phân đoạn văn bản
-      const chunks = this.splitIntoChunks(content);
-      this.logger.log(`Split into ${chunks.length} chunks with content : ${chunks}`);
-
-      // 4. Xử lý từng chunk
-      for (const chunk of chunks) {
-        const embedding = await this.aiHubService.embeddings(chunk);
-        this.logger.log(`Created embedding for chunk, length: ${embedding}`);
-
-        await this.chunkRepository.save({
-          content: chunk,
-          embedding,
-          documentId,
-        });
-        this.logger.log('Chunk saved.');
+      if (!fs.existsSync(this.tempDir)) {
+        await mkdir(this.tempDir, { recursive: true });
       }
-
-      // 5. Cập nhật trạng thái
-      await this.documentRepository.update(documentId, { status: 'Indexed' });
-      this.logger.log(`Finished processing document with ID: ${documentId}`);
     } catch (error) {
-      this.logger.error(`Error processing document ${documentId}: ${error.message}`, error.stack);
-      await this.documentRepository.update(documentId, { status: 'Failed' });
+      this.logger.error(`Error creating temp directory: ${error.message}`);
       throw error;
     }
   }
 
-  private async getFileFromS3(bucket: string, key: string): Promise<string> {
-    const command = new GetObjectCommand({ Bucket: bucket, Key: key });
-    const s3Object = await this.s3Client.send(command);
-    // return new Promise((resolve, reject) => {
-    //   const chunks: any[] = [];
-    //   s3Object.Body.on('data', (chunk) => chunks.push(chunk));
-    //   s3Object.Body.on('error', reject);
-    //   s3Object.Body.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
-    // });
-    // Hàm chuyển stream thành Buffer
-    const streamToBuffer = (stream: any): Promise<Buffer> =>
-      new Promise((resolve, reject) => {
-        const chunks: any[] = [];
-        stream.on('data', (chunk) => {
-          chunks.push(chunk);
-          this.logger.log('Received chunk of size:', chunk.length);
-        });
-        stream.on('error', (err) => {
-          this.logger.error('Error reading stream:', err);
-          reject(err);
-        });
-        stream.on('end', () => {
-          this.logger.log('Stream ended, concatenating chunks');
-          resolve(Buffer.concat(chunks));
-        });
+  async processDocument(documentId: string): Promise<void> {
+    try {
+      const document = await this.documentRepository.findOne({
+        where: { id: documentId },
       });
-    const fileBuffer = await streamToBuffer(s3Object.Body);
-    this.logger.log(`File converted to Buffer, size: ${fileBuffer.length}`);
-    const fileContent = fileBuffer.toString('utf-8');
-    this.logger.log(`File content extracted, length: ${fileContent.length}`);
-    return fileContent;
+
+      if (!document) {
+        throw new Error(`Document with ID ${documentId} not found`);
+      }
+
+      // Cập nhật trạng thái tài liệu
+      document.status = 'Processing';
+      await this.documentRepository.save(document);
+
+      // Thêm document vào queue
+      await this.documentQueueService.addDocumentProcessingJob({
+        documentId: document.id,
+        botId: document.botId,
+        filename: document.filename,
+        s3Key: document.s3Key,
+        mimeType: document.mimeType,
+      });
+
+      this.logger.log(`Document ${documentId} added to processing queue`);
+    } catch (error) {
+      this.logger.error(`Error initiating document processing: ${error.message}`);
+      await this.updateDocumentStatus(documentId, 'Error', error.message);
+      throw error;
+    }
   }
 
-  private splitIntoChunks(text: string, maxLength = 1000): string[] {
-    const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
-    const chunks: string[] = [];
-    let currentChunk = '';
+  private async processDocumentJob(job: DocumentProcessingJob): Promise<void> {
+    try {
+      this.logger.log(`Starting complete document processing for document ${job.documentId}`);
 
-    for (const sentence of sentences) {
-      if (currentChunk.length + sentence.length > maxLength && currentChunk.length > 0) {
-        chunks.push(currentChunk.trim());
-        currentChunk = '';
+      // BƯỚC 1: Tải tài liệu từ S3
+      this.logger.log(`Downloading document from S3: ${job.s3Key}`);
+      const fileBuffer = await this.s3Service.getFile(job.s3Key);
+
+      // Check if the file exists in S3
+      if (!fileBuffer) {
+        this.logger.warn(`File does not exist in S3: ${job.s3Key}`);
+        await this.updateDocumentStatus(
+          job.documentId,
+          'Error',
+          `The file does not exist in S3 bucket: ${job.s3Key}`,
+        );
+        return; // Exit the method early
       }
-      currentChunk += sentence + ' ';
-    }
 
-    if (currentChunk.length > 0) {
-      chunks.push(currentChunk.trim());
+      // BƯỚC 2: Trích xuất nội dung từ tài liệu trực tiếp từ buffer
+      this.logger.log(`Extracting text from document: ${job.filename}`);
+      const extractedText = await this.extractTextFromBuffer(fileBuffer, job.filename);
+
+      // Cập nhật nội dung cho document
+      await this.updateDocumentContent(job.documentId, extractedText);
+
+      // BƯỚC 3: Phân đoạn văn bản - chỉ dùng một phương pháp duy nhất
+      this.logger.log(`Splitting document into chunks`);
+      const chunks = await this.textSplitterService.splitText(extractedText);
+
+      // Cập nhật số lượng chunks vào document
+      await this.updateDocumentChunkCount(job.documentId, chunks.length);
+
+      // BƯỚC 4: Xử lý từng chunk và lưu trữ
+      this.logger.log(`Processing ${chunks.length} chunks for document ${job.documentId}`);
+
+      // Xử lý hàng loạt các chunks thay vì từng cái một
+      const chunkBatchSize = 5; // Xử lý 5 chunks mỗi lần để tránh quá tải API
+
+      for (let i = 0; i < chunks.length; i += chunkBatchSize) {
+        const batchChunks = chunks.slice(i, i + chunkBatchSize);
+
+        // Tạo embeddings cho cả batch
+        const embeddings = await this.embeddingService.createEmbeddingBatch(batchChunks);
+
+        // Lưu từng chunk với embedding vào data-hub
+        for (let j = 0; j < embeddings.length; j++) {
+          const chunkIndex = i + j;
+          const { embedding, text } = embeddings[j];
+
+          await this.saveChunkToDataHub({
+            documentId: job.documentId,
+            botId: job.botId,
+            filename: job.filename,
+            chunkIndex: chunkIndex,
+            totalChunks: chunks.length,
+            text: text,
+            embedding: embedding,
+          });
+        }
+
+        this.logger.log(
+          `Processed chunks ${i + 1} to ${Math.min(i + chunkBatchSize, chunks.length)} of ${
+            chunks.length
+          }`,
+        );
+      }
+
+      // Cập nhật trạng thái tài liệu thành công
+      await this.updateDocumentStatus(job.documentId, 'Processed');
+      this.logger.log(`Document ${job.documentId} processed successfully`);
+    } catch (error) {
+      this.logger.error(`Error processing document: ${error.message}`);
+      await this.updateDocumentStatus(job.documentId, 'Error', error.message);
+      throw error;
     }
-    return chunks;
+  }
+
+  private async saveChunkToDataHub(chunkData: {
+    documentId: string;
+    botId: number;
+    filename: string;
+    chunkIndex: number;
+    totalChunks: number;
+    text: string;
+    embedding: number[];
+  }): Promise<void> {
+    try {
+      // Thêm metadata quan trọng cho việc tìm kiếm RAG sau này
+      const enhancedChunkData = {
+        ...chunkData,
+        metadata: {
+          source: chunkData.filename,
+          documentId: chunkData.documentId,
+          chunkIndex: chunkData.chunkIndex,
+          createdAt: new Date().toISOString(),
+        },
+      };
+
+      // Gọi API của data-hub để lưu chunk
+      await axios.post(`${this.dataHubUrl}/vector-store/chunk`, enhancedChunkData, {
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+      this.logger.log(
+        `Saved chunk ${chunkData.chunkIndex + 1}/${chunkData.totalChunks} for document ${
+          chunkData.documentId
+        } to data-hub`,
+      );
+    } catch (error) {
+      this.logger.error(`Error saving chunk to data-hub: ${error.message}`);
+
+      // Log more specific information about the data-hub endpoint
+      if (error.response?.status === 404) {
+        this.logger.warn(
+          `Data-hub endpoint not found at ${this.dataHubUrl}/vector-store/chunk. Make sure the data-hub service is running and has this endpoint.`,
+        );
+      }
+
+      // Re-throw the error to be caught by the calling method
+      throw error;
+    }
+  }
+
+  private async extractTextFromBuffer(fileBuffer: Buffer, filename: string): Promise<string> {
+    try {
+      // Trích xuất text từ buffer dựa vào loại file
+      const extension = path.extname(filename).toLowerCase();
+      this.logger.log(`Extracting text from buffer for ${filename} with extension ${extension}`);
+
+      // Xử lý theo định dạng file - sử dụng buffer trực tiếp mà không cần lưu file tạm
+      switch (extension) {
+        case '.pdf':
+          try {
+            // Sử dụng pdf-parse để xử lý file PDF
+            const pdfParse = require('pdf-parse');
+            const data = await pdfParse(fileBuffer);
+            return data.text || '';
+          } catch (err) {
+            this.logger.error(`Error processing PDF document: ${err.message}`);
+            return `Error extracting text from PDF ${filename}: ${err.message}. Please install pdf-parse package.`;
+          }
+
+        case '.docx':
+        case '.doc':
+          try {
+            // Đoạn code này giả định rằng mammoth đã được cài đặt
+            // Trong môi trường thực tế, hãy chạy: npm install mammoth --save
+            const mammoth = require('mammoth');
+            const result = await mammoth.extractRawText({ buffer: fileBuffer });
+            return result.value || '';
+          } catch (err) {
+            this.logger.error(`Error processing Word document with mammoth: ${err.message}`);
+            // Fallback: trả về thông báo lỗi nếu mammoth chưa được cài đặt hoặc xử lý không thành công
+            return `Error extracting text from ${filename}: ${err.message}. Please install mammoth package.`;
+          }
+
+        case '.txt':
+          // Đối với text, chuyển buffer thành string
+          return fileBuffer.toString('utf8');
+
+        default:
+          // Mặc định chuyển buffer thành string cho các loại file khác
+          this.logger.warn(`Unsupported file type: ${extension}, processing as text`);
+          return fileBuffer.toString('utf8');
+      }
+    } catch (error) {
+      this.logger.error(`Error extracting text from buffer: ${error.message}`);
+      throw error;
+    }
+  }
+
+  private async extractTextFromFile(filePath: string, filename: string): Promise<string> {
+    try {
+      // Trích xuất text từ file dựa vào loại file
+      const extension = path.extname(filename).toLowerCase();
+      this.logger.log(`Extracting text from ${filename} with extension ${extension}`);
+
+      // Xử lý theo định dạng file
+      switch (extension) {
+        case '.pdf':
+          try {
+            const pdfParse = require('pdf-parse');
+            const dataBuffer = fs.readFileSync(filePath);
+            const data = await pdfParse(dataBuffer);
+            return data.text || '';
+          } catch (err) {
+            this.logger.error(`Error processing PDF file: ${err.message}`);
+            return `Error extracting text from PDF ${filename}: ${err.message}`;
+          }
+
+        case '.docx':
+        case '.doc':
+          try {
+            const mammoth = require('mammoth');
+            const result = await mammoth.extractRawText({ path: filePath });
+            return result.value || '';
+          } catch (err) {
+            this.logger.error(`Error processing Word file with mammoth: ${err.message}`);
+            return `Error extracting text from ${filename}: ${err.message}`;
+          }
+
+        case '.txt':
+          return fs.readFileSync(filePath, 'utf8');
+
+        case '.csv':
+          const content = fs.readFileSync(filePath, 'utf8');
+          return content;
+
+        default:
+          this.logger.warn(`Unsupported file type: ${extension}, processing as text`);
+          return fs.readFileSync(filePath, 'utf8');
+      }
+    } catch (error) {
+      this.logger.error(`Error extracting text from file: ${error.message}`);
+      throw error;
+    }
+  }
+
+  private async updateDocumentContent(documentId: string, content: string): Promise<void> {
+    try {
+      await this.documentRepository.update(documentId, { content });
+    } catch (error) {
+      this.logger.error(`Error updating document content: ${error.message}`);
+      throw error;
+    }
+  }
+
+  private async updateDocumentChunkCount(documentId: string, chunkCount: number): Promise<void> {
+    try {
+      await this.documentRepository.update(documentId, { chunkCount });
+    } catch (error) {
+      this.logger.error(`Error updating document chunk count: ${error.message}`);
+      throw error;
+    }
+  }
+
+  private async updateDocumentStatus(
+    documentId: string,
+    status: string,
+    errorMessage?: string,
+  ): Promise<void> {
+    try {
+      await this.documentRepository.update(documentId, {
+        status,
+        processingError: errorMessage || null,
+      });
+    } catch (error) {
+      this.logger.error(`Error updating document status: ${error.message}`);
+      throw error;
+    }
   }
 }
