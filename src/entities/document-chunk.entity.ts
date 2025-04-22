@@ -14,7 +14,7 @@ export class DocumentChunk {
   @Column('text')
   content: string;
 
-  @Column('float', { array: true })
+  @Column('float', { array: true, nullable: true })
   embedding: number[];
 
   @Column()

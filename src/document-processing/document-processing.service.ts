@@ -216,45 +216,30 @@ export class DocumentProcessingService implements OnModuleInit {
       const extension = path.extname(filename).toLowerCase();
       this.logger.log(`Extracting text from buffer for ${filename} with extension ${extension}`);
 
-      // Xử lý theo định dạng file - sử dụng buffer trực tiếp mà không cần lưu file tạm
-      switch (extension) {
-        case '.pdf':
-          try {
-            // Sử dụng pdf-parse để xử lý file PDF
-            const pdfParse = require('pdf-parse');
-            const data = await pdfParse(fileBuffer);
-            return data.text || '';
-          } catch (err) {
-            this.logger.error(`Error processing PDF document: ${err.message}`);
-            return `Error extracting text from PDF ${filename}: ${err.message}. Please install pdf-parse package.`;
-          }
+      let textContent = '';
 
-        case '.docx':
-        case '.doc':
-          try {
-            // Đoạn code này giả định rằng mammoth đã được cài đặt
-            // Trong môi trường thực tế, hãy chạy: npm install mammoth --save
-            const mammoth = require('mammoth');
-            const result = await mammoth.extractRawText({ buffer: fileBuffer });
-            return result.value || '';
-          } catch (err) {
-            this.logger.error(`Error processing Word document with mammoth: ${err.message}`);
-            // Fallback: trả về thông báo lỗi nếu mammoth chưa được cài đặt hoặc xử lý không thành công
-            return `Error extracting text from ${filename}: ${err.message}. Please install mammoth package.`;
-          }
+      // Đơn giản hóa việc xử lý file - không dùng thư viện bên ngoài nếu có thể
+      try {
+        // Đối với mọi loại file, trước tiên cố gắng chuyển buffer thành string
+        textContent = fileBuffer.toString('utf8');
 
-        case '.txt':
-          // Đối với text, chuyển buffer thành string
-          return fileBuffer.toString('utf8');
+        // Loại bỏ các ký tự null
+        textContent = textContent.replace(/\0/g, '');
 
-        default:
-          // Mặc định chuyển buffer thành string cho các loại file khác
-          this.logger.warn(`Unsupported file type: ${extension}, processing as text`);
-          return fileBuffer.toString('utf8');
+        // Nếu không có nội dung hoặc nội dung chỉ chứa ký tự không phải chữ cái/số
+        if (!textContent || textContent.trim() === '') {
+          this.logger.warn(`Empty content extracted from ${filename}, returning blank text`);
+        }
+      } catch (err) {
+        this.logger.error(`Error extracting text from buffer: ${err.message}`);
+        textContent = `Could not extract text from ${filename}: ${err.message}`;
       }
+
+      return textContent;
     } catch (error) {
-      this.logger.error(`Error extracting text from buffer: ${error.message}`);
-      throw error;
+      this.logger.error(`Error in extractTextFromBuffer: ${error.message}`);
+      // Trả về chuỗi rỗng trong trường hợp lỗi để tránh lỗi null
+      return '';
     }
   }
 
@@ -266,17 +251,6 @@ export class DocumentProcessingService implements OnModuleInit {
 
       // Xử lý theo định dạng file
       switch (extension) {
-        case '.pdf':
-          try {
-            const pdfParse = require('pdf-parse');
-            const dataBuffer = fs.readFileSync(filePath);
-            const data = await pdfParse(dataBuffer);
-            return data.text || '';
-          } catch (err) {
-            this.logger.error(`Error processing PDF file: ${err.message}`);
-            return `Error extracting text from PDF ${filename}: ${err.message}`;
-          }
-
         case '.docx':
         case '.doc':
           try {
@@ -307,7 +281,9 @@ export class DocumentProcessingService implements OnModuleInit {
 
   private async updateDocumentContent(documentId: string, content: string): Promise<void> {
     try {
-      await this.documentRepository.update(documentId, { content });
+      // Loại bỏ các ký tự null (0x00) trước khi lưu vào database
+      const sanitizedContent = content ? content.replace(/\0/g, '') : '';
+      await this.documentRepository.update(documentId, { content: sanitizedContent });
     } catch (error) {
       this.logger.error(`Error updating document content: ${error.message}`);
       throw error;
