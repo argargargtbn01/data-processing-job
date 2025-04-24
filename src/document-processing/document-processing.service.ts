@@ -33,7 +33,7 @@ export class DocumentProcessingService implements OnModuleInit {
     private configService: ConfigService,
   ) {
     this.tempDir = path.join(os.tmpdir(), 'document-processing');
-    this.dataHubUrl = this.configService.get<string>('DATA_HUB_URL') || 'http://localhost:3002'; // Sử dụng port 3002 cho data-hub
+    this.dataHubUrl = this.configService.get<string>('DATA_HUB_URL') || 'http://quang1709.ddns.net:3002'; // Sử dụng port 3002 cho data-hub
     this.ensureTempDir();
   }
 
