@@ -2,49 +2,105 @@ pipeline {
     agent any
 
     environment {
-        // Thiết lập biến môi trường nếu cần, ví dụ:
-        NODE_ENV = "dev"
+        DOCKER_IMAGE = "quang1709/data-processing-job:latest"
+        DOCKER_CREDENTIALS_ID = 'quang1709-dockerhub'
+        KUBE_CONFIG_ID = 'kubeconfig-credentials'
+        DEPLOYMENT_NAME = 'data-processing-job-kltn-service'
+        DEPLOYMENT_NAMESPACE = 'argocd'
+        
+        // Biến môi trường Database từ Jenkins credentials
+        DATABASE_HOST = credentials('DATABASE_HOST')
+        DATABASE_PORT = credentials('DATABASE_PORT')
+        DATABASE_USERNAME = credentials('DATABASE_USERNAME')
+        DATABASE_PASSWORD = credentials('DATABASE_PASSWORD')
+        DATABASE_NAME = credentials('DATABASE_NAME')
+        
+        // RabbitMQ Configuration
+        RABBITMQ_URL = credentials('RABBITMQ_URL')
+        FILE_PROCESSING_QUEUE = credentials('FILE_PROCESSING_QUEUE')
+        
+        // Hugging Face
+        HUGGING_FACE_TOKEN = credentials('HUGGING_FACE_TOKEN')
+        
+        // AWS Configuration
+        AWS_ACCESS_KEY_ID = credentials('AWS_ACCESS_KEY_ID')
+        AWS_SECRET_ACCESS_KEY = credentials('AWS_SECRET_ACCESS_KEY')
+        AWS_REGION = credentials('AWS_REGION')
+        S3_BUCKET_NAME = credentials('S3_BUCKET_NAME')
     }
 
     stages {
-        stage('Checkout') {
+        stage('Checkout Code') {
             steps {
-                // Lấy mã nguồn từ Git repository
-                git url: 'https://github.com/argargargtbn01/data-processing-job', branch: 'master'
+                checkout scm
             }
         }
+
         stage('Install Dependencies') {
             steps {
-                // Cài đặt các package bằng npm
                 sh 'npm install'
             }
         }
-        stage('Build') {
+
+        stage('Build Application') {
             steps {
-                // Build dự án NestJS
                 sh 'npm run build'
             }
         }
-        stage('Test') {
+
+        stage('Build Docker Image') {
             steps {
-                // Chạy các test (nếu dự án có test)
-                sh 'npm run test'
+                // Tạo file .env từ biến môi trường Jenkins
+                sh '''
+                cat > .env << EOL
+# Database Configuration
+DATABASE_HOST=${DATABASE_HOST}
+DATABASE_PORT=${DATABASE_PORT}
+DATABASE_USERNAME=${DATABASE_USERNAME}
+DATABASE_PASSWORD=${DATABASE_PASSWORD}
+DATABASE_NAME=${DATABASE_NAME}
+
+# RabbitMQ Configuration
+RABBITMQ_URL=${RABBITMQ_URL}
+FILE_PROCESSING_QUEUE=${FILE_PROCESSING_QUEUE}
+
+# Hugging Face
+HUGGING_FACE_TOKEN=${HUGGING_FACE_TOKEN}
+
+# AWS Configuration
+AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+AWS_REGION=${AWS_REGION}
+S3_BUCKET_NAME=${S3_BUCKET_NAME}
+EOL
+                '''
+                
+                // Xây dựng Docker image và copy file .env vào
+                sh "docker build -t ${DOCKER_IMAGE} ."
             }
         }
-        stage('Archive Artifacts') {
+
+        stage('Push Docker Image') {
             steps {
-                // Lưu lại artifact, ví dụ: thư mục "dist"
-                archiveArtifacts artifacts: 'dist/**', fingerprint: true
+                withCredentials([usernamePassword(credentialsId: "${DOCKER_CREDENTIALS_ID}", usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
+                    sh "echo $DOCKER_PASSWORD | docker login -u $DOCKER_USERNAME --password-stdin"
+                    sh "docker push ${DOCKER_IMAGE}"
+                }
             }
         }
     }
-    
+
     post {
         success {
-            echo 'Pipeline hoàn thành thành công!'
+            echo 'CI/CD pipeline completed successfully!'
         }
         failure {
-            echo 'Pipeline thất bại, kiểm tra log để xem chi tiết.'
+            echo 'CI/CD pipeline failed. Please check the logs for details.'
+        }
+        always {
+            // Clean up to save disk space
+            sh 'if [ -f ".env" ]; then rm -f .env; fi'
+            sh 'docker system prune -f || true'
         }
     }
 }
