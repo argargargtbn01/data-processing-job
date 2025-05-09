@@ -33,7 +33,8 @@ export class DocumentProcessingService implements OnModuleInit {
     private configService: ConfigService,
   ) {
     this.tempDir = path.join(os.tmpdir(), 'document-processing');
-    this.dataHubUrl = this.configService.get<string>('DATA_HUB_URL') || 'http://quang1709.ddns.net:3002'; // Sử dụng port 3002 cho data-hub
+    this.dataHubUrl =
+      this.configService.get<string>('DATA_HUB_URL') || 'http://quang1709.ddns.net:3002'; // Sử dụng port 3002 cho data-hub
     this.ensureTempDir();
   }
 
@@ -86,6 +87,45 @@ export class DocumentProcessingService implements OnModuleInit {
     }
   }
 
+  /**
+   * Xử lý tài liệu đồng bộ không thông qua queue
+   */
+  async processDocumentSync(documentId: string): Promise<void> {
+    try {
+      this.logger.log(`Starting synchronous document processing for document ${documentId}`);
+
+      const document = await this.documentRepository.findOne({
+        where: { id: documentId },
+      });
+
+      if (!document) {
+        throw new Error(`Document with ID ${documentId} not found`);
+      }
+
+      // Cập nhật trạng thái tài liệu
+      document.status = 'Processing';
+      await this.documentRepository.save(document);
+
+      // Tạo job tương tự như từ queue
+      const job: DocumentProcessingJob = {
+        documentId: document.id,
+        botId: document.botId,
+        filename: document.filename,
+        s3Key: document.s3Key,
+        mimeType: document.mimeType,
+      };
+
+      // Xử lý tài liệu trực tiếp mà không qua queue
+      await this.processDocumentJob(job);
+
+      this.logger.log(`Synchronous document processing completed for document ${documentId}`);
+    } catch (error) {
+      this.logger.error(`Error processing document synchronously: ${error.message}`);
+      await this.updateDocumentStatus(documentId, 'Error', error.message);
+      throw error;
+    }
+  }
+
   private async processDocumentJob(job: DocumentProcessingJob): Promise<void> {
     try {
       this.logger.log(`Starting complete document processing for document ${job.documentId}`);
@@ -122,45 +162,245 @@ export class DocumentProcessingService implements OnModuleInit {
       // BƯỚC 4: Xử lý từng chunk và lưu trữ
       this.logger.log(`Processing ${chunks.length} chunks for document ${job.documentId}`);
 
-      // Xử lý hàng loạt các chunks thay vì từng cái một
-      const chunkBatchSize = 5; // Xử lý 5 chunks mỗi lần để tránh quá tải API
+      // Xử lý hàng loạt các chunks thay vì từng cái một - giảm kích thước batch
+      const chunkBatchSize = 3; // Giảm từ 5 xuống 3 để giảm tải cho API
+      let failedChunks = 0;
 
       for (let i = 0; i < chunks.length; i += chunkBatchSize) {
         const batchChunks = chunks.slice(i, i + chunkBatchSize);
 
-        // Tạo embeddings cho cả batch
-        const embeddings = await this.embeddingService.createEmbeddingBatch(batchChunks);
+        try {
+          // Tạo embeddings cho cả batch
+          const embeddings = await this.embeddingService.createEmbeddingBatch(batchChunks);
 
-        // Lưu từng chunk với embedding vào data-hub
-        for (let j = 0; j < embeddings.length; j++) {
-          const chunkIndex = i + j;
-          const { embedding, text } = embeddings[j];
+          // Lưu từng chunk với embedding vào data-hub
+          for (let j = 0; j < embeddings.length; j++) {
+            const chunkIndex = i + j;
+            const { embedding, text } = embeddings[j];
 
-          await this.saveChunkToDataHub({
-            documentId: job.documentId,
-            botId: job.botId,
-            filename: job.filename,
-            chunkIndex: chunkIndex,
-            totalChunks: chunks.length,
-            text: text,
-            embedding: embedding,
-          });
+            // Kiểm tra embedding trước khi lưu
+            if (!embedding || !Array.isArray(embedding) || embedding.length === 0) {
+              this.logger.warn(`Invalid embedding for chunk ${chunkIndex}, retrying...`);
+              try {
+                // Thử lại với cơ chế retry
+                const retryEmbedding = await this.createEmbeddingWithRetry(text);
+                await this.saveChunkToDataHubWithRetry({
+                  documentId: job.documentId,
+                  botId: job.botId,
+                  filename: job.filename,
+                  chunkIndex: chunkIndex,
+                  totalChunks: chunks.length,
+                  text: text,
+                  embedding: retryEmbedding,
+                });
+              } catch (error) {
+                this.logger.error(
+                  `Failed to create embedding for chunk ${chunkIndex} after retries: ${error.message}`,
+                );
+                failedChunks++;
+              }
+            } else {
+              await this.saveChunkToDataHubWithRetry({
+                documentId: job.documentId,
+                botId: job.botId,
+                filename: job.filename,
+                chunkIndex: chunkIndex,
+                totalChunks: chunks.length,
+                text: text,
+                embedding: embedding,
+              });
+            }
+          }
+
+          this.logger.log(
+            `Processed chunks ${i + 1} to ${Math.min(i + chunkBatchSize, chunks.length)} of ${
+              chunks.length
+            }`,
+          );
+
+          // Thêm độ trễ giữa các batch để tránh quá tải API
+          if (i + chunkBatchSize < chunks.length) {
+            this.logger.debug('Adding delay between batches to avoid API rate limiting');
+            await new Promise((resolve) => setTimeout(resolve, 1000)); // 1s delay
+          }
+        } catch (error) {
+          this.logger.error(`Error processing batch starting at chunk ${i}: ${error.message}`);
+          failedChunks += batchChunks.length;
         }
-
-        this.logger.log(
-          `Processed chunks ${i + 1} to ${Math.min(i + chunkBatchSize, chunks.length)} of ${
-            chunks.length
-          }`,
-        );
       }
 
-      // Cập nhật trạng thái tài liệu thành công
-      await this.updateDocumentStatus(job.documentId, 'Processed');
-      this.logger.log(`Document ${job.documentId} processed successfully`);
+      // Báo cáo về các chunks thất bại
+      if (failedChunks > 0) {
+        this.logger.warn(
+          `Document ${job.documentId} processed with ${failedChunks}/${chunks.length} failed chunks`,
+        );
+        await this.updateDocumentStatus(
+          job.documentId,
+          'Processed with errors',
+          `${failedChunks} chunks failed to process`,
+        );
+      } else {
+        // Cập nhật trạng thái tài liệu thành công
+        await this.updateDocumentStatus(job.documentId, 'Processed');
+        this.logger.log(`Document ${job.documentId} processed successfully`);
+      }
+
+      // Xác minh xem tất cả các chunks có được lưu đúng không
+      await this.verifyDocumentProcessed(job.documentId, job.botId, chunks.length);
     } catch (error) {
       this.logger.error(`Error processing document: ${error.message}`);
       await this.updateDocumentStatus(job.documentId, 'Error', error.message);
       throw error;
+    }
+  }
+
+  private async createEmbeddingWithRetry(text: string, maxRetries = 3): Promise<number[]> {
+    let retries = 0;
+    let lastError;
+
+    while (retries < maxRetries) {
+      try {
+        this.logger.debug(`Creating embedding attempt ${retries + 1}/${maxRetries}`);
+        const embedding = await this.embeddingService.createEmbedding(text);
+
+        // Kiểm tra embedding có hợp lệ không
+        if (embedding && Array.isArray(embedding) && embedding.length > 0) {
+          this.logger.debug(
+            `Successfully created embedding with ${embedding.length} dimensions on attempt ${
+              retries + 1
+            }`,
+          );
+          return embedding;
+        }
+
+        throw new Error('Embedding is empty or invalid');
+      } catch (error) {
+        lastError = error;
+        retries++;
+        this.logger.warn(`Embedding attempt ${retries}/${maxRetries} failed: ${error.message}`);
+
+        // Tăng thời gian chờ theo cấp số nhân
+        const delayMs = 1000 * Math.pow(2, retries - 1); // 1s, 2s, 4s
+        this.logger.debug(`Waiting ${delayMs}ms before retry`);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+
+    throw lastError || new Error(`Failed to create embedding after ${maxRetries} attempts`);
+  }
+
+  private async saveChunkToDataHubWithRetry(
+    chunkData: {
+      documentId: string;
+      botId: number;
+      filename: string;
+      chunkIndex: number;
+      totalChunks: number;
+      text: string;
+      embedding: number[];
+    },
+    maxRetries = 3,
+  ): Promise<void> {
+    let retries = 0;
+    let lastError;
+
+    // Kiểm tra embedding hợp lệ trước khi thử lưu
+    if (
+      !chunkData.embedding ||
+      !Array.isArray(chunkData.embedding) ||
+      chunkData.embedding.length === 0
+    ) {
+      throw new Error('Invalid embedding: vector must have at least 1 dimension');
+    }
+
+    while (retries < maxRetries) {
+      try {
+        // Thêm metadata quan trọng cho việc tìm kiếm RAG sau này
+        const enhancedChunkData = {
+          ...chunkData,
+          metadata: {
+            source: chunkData.filename,
+            documentId: chunkData.documentId,
+            chunkIndex: chunkData.chunkIndex,
+            createdAt: new Date().toISOString(),
+          },
+        };
+
+        // Gọi API của data-hub để lưu chunk
+        const response = await axios.post(
+          `${this.dataHubUrl}/vector-store/chunk`,
+          enhancedChunkData,
+          {
+            headers: { 'Content-Type': 'application/json' },
+            timeout: 10000, // 10 giây timeout
+          },
+        );
+
+        // Kiểm tra phản hồi để đảm bảo chunk đã được lưu đúng
+        if (response.status !== 201 && response.status !== 200) {
+          throw new Error(`Unexpected response status: ${response.status}`);
+        }
+
+        this.logger.log(
+          `Saved chunk ${chunkData.chunkIndex + 1}/${chunkData.totalChunks} for document ${
+            chunkData.documentId
+          } to data-hub successfully`,
+        );
+
+        return; // Thoát khỏi vòng lặp nếu thành công
+      } catch (error) {
+        lastError = error;
+        retries++;
+
+        this.logger.error(
+          `Error saving chunk to data-hub (attempt ${retries}/${maxRetries}): ${error.message}`,
+        );
+
+        if (retries >= maxRetries) {
+          break;
+        }
+
+        // Tăng thời gian chờ theo cấp số nhân
+        const delayMs = 1000 * Math.pow(2, retries - 1); // 1s, 2s, 4s
+        this.logger.debug(`Waiting ${delayMs}ms before retry saving chunk`);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+
+    // Nếu không thành công sau nhiều lần thử, ném lỗi
+    throw lastError || new Error(`Failed to save chunk after ${maxRetries} attempts`);
+  }
+
+  private async verifyDocumentProcessed(
+    documentId: string,
+    botId: number,
+    expectedChunks: number,
+  ): Promise<void> {
+    try {
+      this.logger.log(`Verifying document ${documentId} processing...`);
+
+      // Gọi API kiểm tra số lượng chunks đã được lưu
+      const response = await axios.get(
+        `${this.dataHubUrl}/vector-store/document/${documentId}/chunks-count`,
+        {
+          params: { botId },
+          timeout: 5000,
+        },
+      );
+
+      const savedChunks = response.data?.count || 0;
+
+      if (savedChunks < expectedChunks) {
+        this.logger.warn(
+          `Document ${documentId} verification: Found only ${savedChunks}/${expectedChunks} chunks. Some chunks might be missing.`,
+        );
+      } else {
+        this.logger.log(
+          `Document ${documentId} verification successful: All ${savedChunks} chunks saved.`,
+        );
+      }
+    } catch (error) {
+      this.logger.error(`Error verifying document processing: ${error.message}`);
     }
   }
 

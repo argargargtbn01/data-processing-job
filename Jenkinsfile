@@ -27,6 +27,8 @@ pipeline {
         AWS_SECRET_ACCESS_KEY = credentials('AWS_SECRET_ACCESS_KEY')
         AWS_REGION = credentials('AWS_REGION')
         S3_BUCKET_NAME = credentials('S3_BUCKET_NAME')
+
+        GOOGLE_API_KEY = credentials('GOOGLE_API_KEY')
     }
 
     stages {
@@ -72,6 +74,7 @@ AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
 AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
 AWS_REGION=${AWS_REGION}
 S3_BUCKET_NAME=${S3_BUCKET_NAME}
+GOOGLE_API_KEY=${GOOGLE_API_KEY}
 EOL
                 '''
                 
